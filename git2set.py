@@ -28,36 +28,28 @@ def run_git_command(command, cwd, check=True, capture_output=True, text=True):
         print(f"Error: 'git' command not found. Is Git installed and in your PATH?", file=sys.stderr)
         raise
 
-def get_commit_diff(commit_hash, file_path, repo_path):
-    """Gets the diff for a specific file in a specific commit."""
-    # Try getting diff against parent first
+def get_file_content_at_commit(commit_ref, file_path, repo_path):
+    """Gets the content of a file at a specific commit revision."""
+    if not commit_ref: # Handle cases like initial commit having no parent
+        return "" # Return empty string if no commit ref is provided (e.g., parent of first commit)
+
+    command = ['git', 'show', f'{commit_ref}:{file_path}']
     try:
-        # Use --no-patch to check existence and type, then get diff if it's not a submodule etc.
-        # This might be overly complex, stick to simpler diff first.
-        diff_command = ['git', 'diff', f'{commit_hash}^..{commit_hash}', '--', file_path]
-        result = run_git_command(diff_command, cwd=repo_path)
-        return result.stdout
+        result = run_git_command(command, cwd=repo_path, check=False) # Don't check=True, handle errors below
+        if result.returncode == 0:
+            return result.stdout
+        else:
+            # Common errors: file not found at this revision (new file, deleted file)
+            # stderr might contain "fatal: Path '...' does not exist in '...'"
+            # print(f"Info: Could not get content for '{file_path}' at ref '{commit_ref}'. It might not exist at this point. Stderr: {result.stderr.strip()}", file=sys.stderr)
+            return "" # Return empty string for files not existing at this ref
     except subprocess.CalledProcessError as e:
-        # This often fails for the very first commit (no parent ^) or merge commits (handled by --no-merges).
-        # Fallback to 'git show' which includes headers but works more reliably for single commits.
-        # print(f"Warning: 'git diff {commit_hash}^..{commit_hash}' failed for {file_path}. Falling back to 'git show'. Error: {e.stderr}", file=sys.stderr)
-        try:
-            show_command = ['git', 'show', commit_hash, '--', file_path]
-            result = run_git_command(show_command, cwd=repo_path)
-            # Attempt to strip the header git show adds
-            diff_content = result.stdout
-            diff_start_index = diff_content.find('\ndiff --git')
-            if diff_start_index != -1:
-                 # Find the start of the actual diff content after the header
-                 header_end_index = diff_content.find('\n--- a/', diff_start_index)
-                 if header_end_index != -1:
-                     return diff_content[header_end_index+1:] # +1 to remove leading newline
-            # If header stripping fails, return the full 'show' output as a best effort
-            return diff_content
-        except subprocess.CalledProcessError as show_e:
-            print(f"Error: Both 'git diff' and 'git show' failed for file '{file_path}' in commit '{commit_hash}'.", file=sys.stderr)
-            print(f"Show command error: {show_e.stderr}", file=sys.stderr)
-            return None # Indicate failure
+        # This might indicate a more serious git issue
+        print(f"Error running git show for {commit_ref}:{file_path}: {e.stderr}", file=sys.stderr)
+        return None # Indicate a failure to retrieve content
+    except Exception as e:
+        print(f"Unexpected error in get_file_content_at_commit for {commit_ref}:{file_path}: {e}", file=sys.stderr)
+        return None # Indicate failure
 
 def main():
     parser = argparse.ArgumentParser(description="Generate AI training dataset from Git repository history.")
@@ -203,29 +195,52 @@ def main():
                     # Process matching files for this commit
                     for file_path in matching_files:
                         # print(f"  Processing file: {file_path}", file=sys.stderr) # Reduce verbosity
-                        file_diff = get_commit_diff(commit_hash, file_path, repo_path)
 
-                        if file_diff is not None and file_diff.strip(): # Ensure diff is not empty
-                            # Format and write to JSONL
-                            data = {
-                                "messages": [
-                                    {"role": "system", "content": args.system_prompt},
-                                    {"role": "user", "content": commit_message.strip()},
-                                    {"role": "assistant", "content": file_diff.strip()}
-                                ]
-                            }
-                            try:
-                                json.dump(data, outfile, ensure_ascii=False)
-                                outfile.write('\n')
-                                output_count += 1
-                            except Exception as e:
-                                print(f"Error writing JSON for commit {commit_hash}, file {file_path}: {e}", file=sys.stderr)
-                                error_count += 1
-                        elif file_diff is None:
-                            # Error occurred getting diff
+                        # Get content at parent commit (old content)
+                        # Need the parent hash. For the very first commit, there's no parent.
+                        # We can try getting the parent hash, but git diff-tree doesn't easily provide it.
+                        # A simpler approach for now is to use commit_hash^, which works for non-initial commits.
+                        # get_file_content_at_commit handles the case where the file didn't exist in the parent.
+                        parent_ref = f"{commit_hash}^"
+                        old_content = get_file_content_at_commit(parent_ref, file_path, repo_path)
+
+                        # Get content at current commit (new content)
+                        new_content = get_file_content_at_commit(commit_hash, file_path, repo_path)
+
+                        # Check for errors during content retrieval
+                        if old_content is None or new_content is None:
                             error_count += 1
-                            print(f"Skipping file '{file_path}' in commit '{commit_hash}' due to diff retrieval error.", file=sys.stderr)
-                        # else: diff was empty, just skip
+                            print(f"Skipping file '{file_path}' in commit '{commit_hash}' due to content retrieval error.", file=sys.stderr)
+                            continue # Skip this file
+
+                        # Skip if both old and new content are empty (e.g., file created and deleted between commits?)
+                        # Or more likely, if the file only contained whitespace which gets stripped.
+                        # Let's only skip if the *new* content is effectively empty after stripping.
+                        # We want to capture file deletions (old content exists, new is empty).
+                        if not new_content.strip() and not old_content.strip():
+                             # print(f"Skipping file '{file_path}' in commit '{commit_hash}' because both old and new content are empty.", file=sys.stderr)
+                             continue
+
+
+                        # Format the messages
+                        old_content_message = f"File: `{file_path}`\n```\n{old_content.strip()}\n```"
+                        new_content_message = f"File: `{file_path}`\n```\n{new_content.strip()}\n```"
+
+                        # Format and write to JSONL
+                        data = {
+                            "messages": [
+                                {"role": "system", "content": args.system_prompt},
+                                {"role": "user", "content": f"{commit_message.strip()}\m\m{old_content_message}"},
+                                {"role": "assistant", "content": new_content_message}
+                            ]
+                        }
+                        try:
+                            json.dump(data, outfile, ensure_ascii=False)
+                            outfile.write('\n')
+                            output_count += 1
+                        except Exception as e:
+                            print(f"Error writing JSON for commit {commit_hash}, file {file_path}: {e}", file=sys.stderr)
+                            error_count += 1
 
                 # Progress indicator every 100 commits processed
                 if (i + 1) % 100 == 0:
